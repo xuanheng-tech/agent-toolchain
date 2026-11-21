@@ -28,7 +28,7 @@ class PackageAndCliContractTests(unittest.TestCase):
         self.assertEqual(data["build-system"]["build-backend"], "uv_build")
         project = data["project"]
         self.assertEqual(project["name"], "coding-agent-toolchain")
-        self.assertEqual(project["version"], "1.0.0")
+        self.assertEqual(project["version"], "1.0.1")
         self.assertEqual(project["version"], __version__)
         self.assertEqual(TOOL_NAME, "agent-toolchain")
         self.assertEqual(project["requires-python"], ">=3.12,<3.15")
@@ -106,7 +106,7 @@ class PackageAndCliContractTests(unittest.TestCase):
         self.assertEqual(compat["schema_version"], 1)
         self.assertEqual(compat["toolchain_contract_version"], 6)
         self.assertEqual(compat["context_loader_contract_version"], 4)
-        self.assertEqual(compat["snapshot_runner_contract_version"], 4)
+        self.assertEqual(compat["snapshot_runner_contract_version"], 5)
         self.assertEqual(compat["git_finalizer_contract_version"], 10)
         self.assertEqual(compat["worktree_controller_adapter_version"], 3)
         self.assertEqual(compat["worktree_controller_status"], "available_external")
@@ -116,8 +116,8 @@ class PackageAndCliContractTests(unittest.TestCase):
 
         expected_versions = {
             "context-loader": "1.4.0",
-            "snapshot-runner": "2.6.0",
-            "git-finalizer": "2.0.0",
+            "snapshot-runner": "2.7.0",
+            "git-finalizer": "2.0.1",
         }
         skill_hashes: set[str] = set()
         compat_skill_hashes: set[str] = set()
@@ -198,6 +198,7 @@ class PackageAndCliContractTests(unittest.TestCase):
 
         self.assertEqual((ROOT / ".python-version").read_text(encoding="utf-8").strip(), "3.12")
         changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn("## 1.0.1 - 2026-11-22", changelog)
         self.assertIn("## 1.0.0 - 2026-11-20", changelog)
 
         publish_yml = (ROOT / ".github/workflows/publish-pypi.yml").read_text(encoding="utf-8")
@@ -233,9 +234,9 @@ class PackageAndCliContractTests(unittest.TestCase):
                 )
 
     def test_tool_temp_dir_module_version_matches_package_version(self) -> None:
-        self.assertEqual(temp_tool.TOOL_VERSION, "1.0.0")
-        self.assertEqual(sync.VERSION, "1.0.0")
-        self.assertEqual(json.loads(json.dumps({"v": __version__}))["v"], "1.0.0")
+        self.assertEqual(temp_tool.TOOL_VERSION, "1.0.1")
+        self.assertEqual(sync.VERSION, "1.0.1")
+        self.assertEqual(json.loads(json.dumps({"v": __version__}))["v"], "1.0.1")
 
 
 if __name__ == "__main__":

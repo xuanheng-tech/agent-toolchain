@@ -2,7 +2,7 @@
 
 Standalone, zero-dependency pure-Python CLI suite for coding-agent toolchain compatibility verification, Skill synchronization, deployment diagnostics, and safe `/tmp` task directory management.
 
-Current source version: **1.0.0**.
+Current source version: **1.0.1**.
 
 ## Overview
 
@@ -21,13 +21,13 @@ Current source version: **1.0.0**.
 Install from a built wheel or source checkout:
 
 ```bash
-uv tool install 'coding-agent-toolchain==1.0.0'
+uv tool install 'coding-agent-toolchain==1.0.1'
 ```
 
 Or using `pip`:
 
 ```bash
-pip install 'coding-agent-toolchain==1.0.0'
+pip install 'coding-agent-toolchain==1.0.1'
 ```
 
 From a local source checkout, thin executable wrappers are available directly at the repository root:
@@ -74,8 +74,8 @@ The repository carries `toolchain_compatibility.json` (`toolchain_contract_versi
 | Tool | Pinned Version | Contract Version |
 | --- | --- | --- |
 | `context-loader` | `1.4.0` | `4` |
-| `snapshot-runner` | `2.6.0` | `4` |
-| `git-finalizer` | `2.0.0` | `10` |
+| `snapshot-runner` | `2.7.0` | `5` |
+| `git-finalizer` | `2.0.1` | `10` |
 | `worktree-controller` | external runtime | CLI `37..62`, storage `4..5`, adapter `3` |
 
 ## Development

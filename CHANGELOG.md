@@ -4,6 +4,11 @@ All notable changes to `agent-toolchain` are documented in this file.
 
 ## Unreleased
 
+## 1.0.1 - 2026-11-22
+
+- Changed: synced `toolchain_compatibility.json` (`snapshot_runner_contract_version` 5) and `manifests/{context-loader,snapshot-runner,git-finalizer}/tool_skill_manifest.json` with `snapshot-runner` `2.7.0` (contract 5), `git-finalizer` `2.0.1` (contract 10), and the updated `git-change-delivery` Skill payload digest (`9e4790e5...`).
+- Added: recorded the `git-finalizer` `v2.0.1` canonical Skill payload digest in `RELEASED_CANONICAL_SKILL_SHA256` alongside `v2.0.0` lineage for seamless upgrades.
+
 ## 1.0.0 - 2026-11-20
 
 - Added: standalone zero-dependency pure-Python `agent-toolchain` package (PyPI distribution `coding-agent-toolchain`, module `agent_toolchain`, `pyproject.toml` with `uv_build`, `requires-python = ">=3.12,<3.15"`, Apache-2.0) exposing `tool-skill-sync` and `tool-temp-dir` console scripts and thin executable root wrappers.
