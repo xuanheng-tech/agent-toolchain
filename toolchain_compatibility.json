@@ -1,0 +1,95 @@
+{
+  "context_loader_contract_version": 4,
+  "git_finalizer_contract_version": 10,
+  "runtime_requirements": {
+    "worktree-controller": {
+      "capability_versions": {
+        "branch_retirement_execution_version": 1,
+        "branch_retirement_verify_version": 1,
+        "branch_retirement_version": 1,
+        "canonical_transition_version": 1,
+        "capabilities_version": 1,
+        "delivered_closeout_version": 1,
+        "doctor_mount_version": 2,
+        "governance_version": 2,
+        "holder_resolver_version": 2,
+        "integration_publication_execution_version": 1,
+        "namespace_migration_version": 1,
+        "retained_archive_version": 1,
+        "writer_lease_schema_version": 3,
+        "writer_session_version": 2
+      },
+      "cli_contract_versions": [
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62
+      ],
+      "storage_layout_versions": [
+        4,
+        5
+      ]
+    }
+  },
+  "schema_version": 1,
+  "snapshot_runner_contract_version": 4,
+  "toolchain_contract_version": 6,
+  "tools": {
+    "context-loader": {
+      "public_cli_contract_version": 4,
+      "skill_contract_version": 2,
+      "skill_manifest": "manifests/context-loader/tool_skill_manifest.json",
+      "source_directory": "context-loader"
+    },
+    "git-finalizer": {
+      "public_cli_contract_version": 10,
+      "skill_contract_version": 2,
+      "source_directory": "git-finalizer"
+    },
+    "snapshot-runner": {
+      "public_cli_contract_version": 4,
+      "skill_contract_version": 2,
+      "skill_manifest": "manifests/snapshot-runner/tool_skill_manifest.json",
+      "source_directory": "snapshot-runner",
+      "uv_install_policy": {
+        "bin_dir": "~/.local/share/snapshot-runner/bin",
+        "index": [
+          "https://pypi.org/simple"
+        ],
+        "no_build": true
+      }
+    }
+  },
+  "workflow_skill": {
+    "canonical_owner": "git-finalizer",
+    "compatibility_shims": [
+      "three-tool-git-workflow"
+    ],
+    "contract_version": 2,
+    "name": "git-change-delivery"
+  },
+  "worktree_controller_adapter_version": 3,
+  "worktree_controller_status": "available_external"
+}

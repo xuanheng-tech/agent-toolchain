@@ -1,0 +1,55 @@
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "coding-agent-toolchain"
+version = "1.0.0"
+description = "Standalone toolchain compatibility, skill synchronization, and safe task temp-directory CLIs for coding agents"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12,<3.15"
+dependencies = []
+
+[project.scripts]
+tool-skill-sync = "agent_toolchain.tool_skill_sync:main"
+tool-temp-dir = "agent_toolchain.tool_temp_dir:main"
+
+[project.urls]
+Repository = "https://github.com/xuanheng-tech/agent-toolchain"
+Issues = "https://github.com/xuanheng-tech/agent-toolchain/issues"
+
+[tool.uv.build-backend]
+module-name = "agent_toolchain"
+module-root = "src"
+source-include = [
+    "toolchain_compatibility.json",
+    "manifests/**",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "justfile",
+    ".python-version",
+    "tool-skill-sync",
+    "tool-temp-dir",
+    "tests/**",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*.py" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]

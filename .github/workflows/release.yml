@@ -1,0 +1,114 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact annotated tag checkout
+        env:
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_REF_NAME: ${{ github.ref_name }}
+          RELEASE_REF_TYPE: ${{ github.ref_type }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$RELEASE_REF_TYPE" = "tag"
+          test "$RELEASE_REF" = "refs/tags/$RELEASE_REF_NAME"
+          test "$(git rev-parse 'HEAD^{commit}')" = "$RELEASE_SHA"
+          test "$(git rev-parse "${RELEASE_REF}^{commit}")" = "$RELEASE_SHA"
+          test "$(git cat-file -t "$RELEASE_REF")" = "tag"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.19"
+          enable-cache: false
+          github-token: ""
+      - name: Install Python 3.12
+        run: uv python install 3.12
+      - name: Lint and run test suite
+        run: |
+          uv tool run ruff check src tests
+          uv run --no-project --no-config --python 3.12 \
+            python -B -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Verify tag version and extract changelog notes
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re, tomllib
+          tag = os.environ["RELEASE_TAG"]
+          m = re.fullmatch(r"v([0-9]+\.[0-9]+\.[0-9]+)", tag)
+          if not m:
+              raise SystemExit(f"invalid release tag: {tag}")
+          version = m.group(1)
+          pyproject = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))
+          if pyproject["project"]["version"] != version:
+              raise SystemExit("pyproject.toml version mismatch")
+          init_text = pathlib.Path("src/agent_toolchain/__init__.py").read_text(encoding="utf-8")
+          if f'__version__ = "{version}"' not in init_text:
+              raise SystemExit("__init__.py version mismatch")
+          sync_text = pathlib.Path("src/agent_toolchain/tool_skill_sync.py").read_text(encoding="utf-8")
+          if f'VERSION = "{version}"' not in sync_text:
+              raise SystemExit("tool_skill_sync.py version mismatch")
+          changelog = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          sec = re.search(rf"(?ms)^## {re.escape(version)}(?: - [^\n]+)?\n(.*?)(?=^## |\Z)", changelog)
+          if not sec or not sec.group(1).strip():
+              raise SystemExit(f"missing CHANGELOG.md section for {version}")
+          pathlib.Path("release-notes.md").write_text(sec.group(1).strip() + "\n", encoding="utf-8")
+          PY
+      - name: Build distributions and checksums
+        run: |
+          set -euo pipefail
+          uv build --wheel --sdist --no-sources --python 3.12 --out-dir dist
+          rm -f dist/.gitignore
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          for artifact in dist/*.whl dist/*.tar.gz; do
+            venv="$work/venv-$(basename "$artifact")"
+            uv venv "$venv" --python 3.12
+            uv pip install --no-deps --python "$venv/bin/python" "$artifact"
+            "$venv/bin/tool-skill-sync" --version
+            "$venv/bin/tool-temp-dir" --version
+          done
+          (cd dist && sha256sum coding_agent_toolchain-*.whl coding_agent_toolchain-*.tar.gz > SHA256SUMS.txt)
+          cat dist/SHA256SUMS.txt
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            --target "$(git rev-parse 'HEAD^{commit}')" \
+            --title "$RELEASE_TAG" \
+            --notes-file release-notes.md \
+            dist/coding_agent_toolchain-*.whl dist/coding_agent_toolchain-*.tar.gz dist/SHA256SUMS.txt
+      - name: Verify downloaded release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          gh release download "$RELEASE_TAG" --pattern '*' --dir "$work"
+          (cd "$work" && sha256sum --check SHA256SUMS.txt)
+          cmp -s "$work/SHA256SUMS.txt" dist/SHA256SUMS.txt

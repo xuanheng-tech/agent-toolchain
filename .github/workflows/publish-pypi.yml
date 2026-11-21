@@ -1,0 +1,120 @@
+name: publish-pypi
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing annotated vX.Y.Z tag to publish (e.g. v1.0.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pypi-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.19"
+          enable-cache: false
+          github-token: ""
+      - name: Install Python 3.12
+        run: uv python install 3.12
+      - name: Verify tag ancestry, versions, lint, and tests
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$(git cat-file -t "refs/tags/${RELEASE_TAG}")" = "tag"
+          git fetch --quiet origin main
+          git merge-base --is-ancestor HEAD origin/main
+          python3 - <<'PY'
+          import os, pathlib, re, tomllib
+          tag = os.environ["RELEASE_TAG"]
+          m = re.fullmatch(r"v([0-9]+\.[0-9]+\.[0-9]+)", tag)
+          if not m:
+              raise SystemExit(f"invalid release tag: {tag}")
+          version = m.group(1)
+          pyproject = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))
+          if pyproject["project"]["version"] != version:
+              raise SystemExit("pyproject.toml version mismatch")
+          init_text = pathlib.Path("src/agent_toolchain/__init__.py").read_text(encoding="utf-8")
+          if f'__version__ = "{version}"' not in init_text:
+              raise SystemExit("__init__.py version mismatch")
+          sync_text = pathlib.Path("src/agent_toolchain/tool_skill_sync.py").read_text(encoding="utf-8")
+          if f'VERSION = "{version}"' not in sync_text:
+              raise SystemExit("tool_skill_sync.py version mismatch")
+          changelog = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          if not re.search(rf"(?m)^## {re.escape(version)}(?: - [^\n]+)?$", changelog):
+              raise SystemExit(f"missing CHANGELOG.md section for {version}")
+          PY
+          uv tool run ruff check src tests
+          uv run --no-project --no-config --python 3.12 \
+            python -B -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Build wheel and sdist and verify clean installs
+        run: |
+          set -euo pipefail
+          uv build --wheel --sdist --no-sources --python 3.12 --out-dir dist
+          rm -f dist/.gitignore
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          for artifact in dist/*.whl dist/*.tar.gz; do
+            venv="$work/venv-$(basename "$artifact")"
+            uv venv "$venv" --python 3.12
+            uv pip install --no-deps --python "$venv/bin/python" "$artifact"
+            "$venv/bin/tool-skill-sync" --version
+            "$venv/bin/tool-temp-dir" --version
+          done
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: dist-${{ inputs.tag }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: dist-${{ inputs.tag }}
+          path: dist/
+      - name: Publish package to PyPI via OIDC
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
+        with:
+          packages-dir: dist/
+      - name: Verify published version on PyPI
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          ver="${RELEASE_TAG#v}"
+          url="https://pypi.org/pypi/coding-agent-toolchain/${ver}/json"
+          code=000
+          for attempt in $(seq 1 12); do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' "$url" || true)
+            if [ "$code" = "200" ]; then
+              echo "Verified $url -> HTTP 200"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "PyPI JSON check failed for $url (last HTTP $code)" >&2
+          exit 1

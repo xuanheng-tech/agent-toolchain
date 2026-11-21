@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.19"
+          enable-cache: false
+          github-token: ""
+      - name: Install Python ${{ matrix.python }}
+        run: uv python install "${{ matrix.python }}"
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+        with:
+          just-version: "1.21.0"
+          github-token: ${{ github.token }}
+      - name: Lint with ruff
+        run: uv tool run ruff check src tests
+      - name: Run unit tests
+        run: |
+          uv run --no-project --no-config --python "${{ matrix.python }}" \
+            python -B -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Build wheel and sdist and verify clean install smoke
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          uv build --wheel --sdist --python "${{ matrix.python }}" --out-dir "$work/dist"
+          for artifact in "$work"/dist/*.whl "$work"/dist/*.tar.gz; do
+            venv="$work/venv-$(basename "$artifact")"
+            uv venv "$venv" --python "${{ matrix.python }}"
+            uv pip install --no-deps --python "$venv/bin/python" "$artifact"
+            "$venv/bin/tool-skill-sync" --version
+            "$venv/bin/tool-temp-dir" --version
+          done
