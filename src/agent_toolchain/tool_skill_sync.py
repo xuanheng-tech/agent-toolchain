@@ -2519,7 +2519,8 @@ def _rollback_unlocked(
     }
 
 
-SKILL_LINK_CLIENTS = ("claude", "cursor", "qoder", "qoder-cn")
+SKILL_LINK_CLIENTS = ("claude", "qoder-cn")
+NATIVE_SHARED_ROOT_CLIENTS = ("cursor", "qoder")
 MANAGED_SKILL_NAMES = (SKILL_NAME, COMPATIBILITY_SKILL_NAME)
 
 
@@ -2576,6 +2577,108 @@ def _default_client_homes(home_dir: Path | None = None) -> dict[str, Path]:
     }
 
 
+def _inspect_client_skill_links(
+    cskills: Path,
+    shared_skills: Path,
+) -> tuple[dict[str, bool], list[str]]:
+    exposed: dict[str, bool] = {}
+    invalid: list[str] = []
+    for sname in MANAGED_SKILL_NAMES:
+        link = cskills / sname
+        target = shared_skills / sname
+        if link.is_symlink():
+            if link.exists() and link.resolve(strict=False) == target.resolve(strict=False):
+                exposed[sname] = True
+            else:
+                exposed[sname] = False
+                invalid.append(sname)
+        elif link.exists():
+            exposed[sname] = False
+            invalid.append(sname)
+        else:
+            exposed[sname] = False
+    return exposed, invalid
+
+
+def _resolve_gemini_skill_path(raw_path: str, gemini_dir: Path) -> Path:
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = gemini_dir.parent / candidate
+    return candidate.resolve(strict=False)
+
+
+def _extract_gemini_registered_paths(
+    cfg_data: Any,
+    gemini_dir: Path,
+    shared_skills: Path,
+) -> tuple[list[str], str | None]:
+    if not isinstance(cfg_data, dict):
+        return [], "Gemini skills.json root must be an object"
+    expected_map = {
+        shared_skills.resolve(strict=False): str(shared_skills),
+        (shared_skills / SKILL_NAME).resolve(strict=False): str(shared_skills / SKILL_NAME),
+    }
+    matched: set[str] = set()
+    if "entries" in cfg_data and cfg_data["entries"] is not None:
+        raw_entries = cfg_data["entries"]
+        if not isinstance(raw_entries, list):
+            return [], "Gemini skills.json field entries must be a list"
+        for item in raw_entries:
+            if not isinstance(item, dict):
+                return [], "Gemini skills.json entries items must be objects"
+            raw_path = item.get("path")
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                return [], "Gemini skills.json entry must contain a non-empty string path"
+            resolved = _resolve_gemini_skill_path(raw_path, gemini_dir)
+            if resolved in expected_map:
+                matched.add(expected_map[resolved])
+    for key in ("paths", "skillPaths", "skills"):
+        val = cfg_data.get(key)
+        if isinstance(val, list):
+            for raw_path in val:
+                if isinstance(raw_path, str) and raw_path.strip():
+                    resolved = _resolve_gemini_skill_path(raw_path, gemini_dir)
+                    if resolved in expected_map:
+                        matched.add(expected_map[resolved])
+    return sorted(matched), None
+
+
+def _summarize_client_statuses(clients: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    buckets: dict[str, list[str]] = {
+        "PASS": [],
+        "DRIFT": [],
+        "FAIL": [],
+        "SKIP": [],
+    }
+    for cname in sorted(clients):
+        st = clients[cname].get("status", "FAIL")
+        if st not in buckets:
+            st = "FAIL"
+        buckets[st].append(cname)
+    if buckets["FAIL"]:
+        overall = "FAIL"
+    elif buckets["DRIFT"]:
+        overall = "DRIFT"
+    elif buckets["PASS"]:
+        overall = "PASS"
+    else:
+        overall = "SKIP"
+    summary = {
+        "status": overall,
+        "counts": {
+            "PASS": len(buckets["PASS"]),
+            "DRIFT": len(buckets["DRIFT"]),
+            "FAIL": len(buckets["FAIL"]),
+            "SKIP": len(buckets["SKIP"]),
+        },
+        "passed": buckets["PASS"],
+        "drifted": buckets["DRIFT"],
+        "failing": buckets["FAIL"],
+        "skipped": buckets["SKIP"],
+    }
+    return overall, summary
+
+
 def _check_multi_client_skills(
     agents_root: Path,
     client_homes: dict[str, Path],
@@ -2585,18 +2688,30 @@ def _check_multi_client_skills(
     if (shared_skills / "synced").exists():
         raise SyncError("personal skill root contains disallowed account-synced directory: skills/synced")
 
+    shared_ready = all(
+        (shared_skills / sname / "SKILL.md").is_file() for sname in MANAGED_SKILL_NAMES
+    )
+
     # Codex reads ~/.agents/skills directly and adds no duplicate symlinks under ~/.codex/skills.
     codex_dir = client_homes["codex"]
-    codex_dup = [
-        name for name in MANAGED_SKILL_NAMES
-        if (codex_dir / "skills" / name).exists() or (codex_dir / "skills" / name).is_symlink()
-    ]
-    clients["codex"] = {
-        "present": codex_dir.is_dir(),
-        "uses_shared_root": True,
-        "duplicate_links": codex_dup,
-        "status": "FAIL" if codex_dup else "PASS",
-    }
+    if not codex_dir.is_dir():
+        clients["codex"] = {
+            "present": False,
+            "uses_shared_root": True,
+            "duplicate_links": [],
+            "status": "SKIP",
+        }
+    else:
+        codex_dup = [
+            name for name in MANAGED_SKILL_NAMES
+            if (codex_dir / "skills" / name).exists() or (codex_dir / "skills" / name).is_symlink()
+        ]
+        clients["codex"] = {
+            "present": True,
+            "uses_shared_root": True,
+            "duplicate_links": codex_dup,
+            "status": "FAIL" if codex_dup else ("PASS" if shared_ready else "DRIFT"),
+        }
 
     for cname in SKILL_LINK_CLIENTS:
         cdir = client_homes[cname]
@@ -2604,22 +2719,55 @@ def _check_multi_client_skills(
             clients[cname] = {"present": False, "status": "SKIP"}
             continue
         cskills = cdir / "skills"
-        if cskills.is_symlink() and cskills.resolve(strict=False) == shared_skills.resolve(strict=False):
+        if cskills.is_symlink():
+            if cskills.resolve(strict=False) == shared_skills.resolve(strict=False):
+                err = f"{cname} uses a whole-root symlink to ~/.agents/skills instead of per-Skill links"
+            else:
+                err = f"{cname} skills directory is an unsafe symlink: {cskills}"
+            clients[cname] = {"present": True, "status": "FAIL", "error": err}
+            continue
+        if cskills.exists() and not cskills.is_dir():
             clients[cname] = {
                 "present": True,
                 "status": "FAIL",
-                "error": f"{cname} uses a whole-root symlink to ~/.agents/skills instead of per-Skill links",
+                "error": f"{cname} skills path is not a directory: {cskills}",
             }
             continue
-        exposed: dict[str, bool] = {}
-        for sname in MANAGED_SKILL_NAMES:
-            link = cskills / sname
-            target = shared_skills / sname
-            exposed[sname] = link.exists() and link.resolve(strict=False) == target.resolve(strict=False)
+        exposed, invalid_links = _inspect_client_skill_links(cskills, shared_skills)
         clients[cname] = {
             "present": True,
             "per_skill_links": exposed,
-            "status": "PASS" if all(exposed.values()) else "DRIFT",
+            "invalid_links": invalid_links,
+            "status": "FAIL" if invalid_links else ("PASS" if all(exposed.values()) else "DRIFT"),
+        }
+
+    for cname in NATIVE_SHARED_ROOT_CLIENTS:
+        cdir = client_homes[cname]
+        if not cdir.is_dir():
+            clients[cname] = {"present": False, "status": "SKIP"}
+            continue
+        cskills = cdir / "skills"
+        if cskills.is_symlink():
+            if cskills.resolve(strict=False) == shared_skills.resolve(strict=False):
+                err = f"{cname} uses a whole-root symlink to ~/.agents/skills instead of native discovery"
+            else:
+                err = f"{cname} skills directory is an unsafe symlink: {cskills}"
+            clients[cname] = {"present": True, "status": "FAIL", "error": err}
+            continue
+        if cskills.exists() and not cskills.is_dir():
+            clients[cname] = {
+                "present": True,
+                "status": "FAIL",
+                "error": f"{cname} skills path is not a directory: {cskills}",
+            }
+            continue
+        exposed, invalid_links = _inspect_client_skill_links(cskills, shared_skills)
+        clients[cname] = {
+            "present": True,
+            "uses_shared_root": True,
+            "per_skill_links": exposed,
+            "invalid_links": invalid_links,
+            "status": "FAIL" if invalid_links else ("PASS" if shared_ready else "DRIFT"),
         }
 
     gemini_dir = client_homes["gemini"]
@@ -2627,27 +2775,50 @@ def _check_multi_client_skills(
         clients["gemini"] = {"present": False, "status": "SKIP"}
     else:
         cfg_path = gemini_dir / "config" / "skills.json"
-        if not cfg_path.is_file():
+        if cfg_path.is_symlink():
+            clients["gemini"] = {
+                "present": True,
+                "config": str(cfg_path),
+                "status": "FAIL",
+                "error": f"unsafe Gemini config symlink: {cfg_path}",
+            }
+        elif cfg_path.exists() and not cfg_path.is_file():
+            clients["gemini"] = {
+                "present": True,
+                "config": str(cfg_path),
+                "status": "FAIL",
+                "error": f"Gemini skills.json is not a regular file: {cfg_path}",
+            }
+        elif not cfg_path.exists():
             clients["gemini"] = {"present": True, "config": str(cfg_path), "status": "DRIFT"}
         else:
             try:
                 cfg_data = json.loads(cfg_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                clients["gemini"] = {"present": True, "config": str(cfg_path), "status": "FAIL"}
-            else:
-                expected_roots = {str(shared_skills), str(shared_skills / SKILL_NAME)}
-                recorded: set[str] = set()
-                if isinstance(cfg_data, dict):
-                    for key in ("paths", "skillPaths", "skills"):
-                        val = cfg_data.get(key)
-                        if isinstance(val, list):
-                            recorded.update(str(v) for v in val if isinstance(v, str))
+            except (OSError, ValueError) as exc:
                 clients["gemini"] = {
                     "present": True,
                     "config": str(cfg_path),
-                    "registered_paths": sorted(recorded & expected_roots),
-                    "status": "PASS" if (recorded & expected_roots) else "DRIFT",
+                    "status": "FAIL",
+                    "error": f"invalid Gemini skills.json: {exc}",
                 }
+            else:
+                registered, cfg_error = _extract_gemini_registered_paths(
+                    cfg_data, gemini_dir, shared_skills
+                )
+                if cfg_error is not None:
+                    clients["gemini"] = {
+                        "present": True,
+                        "config": str(cfg_path),
+                        "status": "FAIL",
+                        "error": cfg_error,
+                    }
+                else:
+                    clients["gemini"] = {
+                        "present": True,
+                        "config": str(cfg_path),
+                        "registered_paths": registered,
+                        "status": "PASS" if registered else "DRIFT",
+                    }
     return clients
 
 
@@ -2657,10 +2828,12 @@ def skill_check(
     agents_root: Path,
     client_homes: dict[str, Path] | None = None,
 ) -> dict[str, Any]:
+    """Verify managed Skill payload/lineage (top-level status) and multi-client exposure."""
     canonical_sha, compat_sha = _validate_skill_source(sources)
     installed_sha, installed_compat_sha = installed_skill_hashes(agents_root)
     homes = _default_client_homes() if client_homes is None else client_homes
     clients = _check_multi_client_skills(agents_root, homes)
+    client_status, clients_summary = _summarize_client_statuses(clients)
     trusted = (
         installed_sha in (None, canonical_sha)
         or installed_sha in RELEASED_CANONICAL_SKILL_SHA256
@@ -2675,6 +2848,8 @@ def skill_check(
         "installed_skill_sha256": installed_sha,
         "installed_compatibility_sha256": installed_compat_sha,
         "trusted_lineage": trusted,
+        "client_status": client_status,
+        "clients_summary": clients_summary,
         "clients": clients,
     }
 
@@ -2689,6 +2864,27 @@ def _sync_multi_client_skills(
         raise SyncError("refusing to sync while skills/synced exists inside shared personal root")
     results: dict[str, Any] = {}
 
+    for cname in NATIVE_SHARED_ROOT_CLIENTS:
+        cdir = client_homes[cname]
+        if not cdir.is_dir():
+            results[cname] = {"status": "SKIP"}
+            continue
+        cskills = cdir / "skills"
+        if cskills.is_symlink():
+            if cskills.resolve(strict=False) == shared_skills.resolve(strict=False):
+                raise SyncError(f"{cname} skills directory must not symlink whole shared root")
+            raise SyncError(f"{cname} skills directory is an unsafe symlink: {cskills}")
+        if cskills.exists() and not cskills.is_dir():
+            raise SyncError(f"{cname} skills path is not a directory: {cskills}")
+        if cskills.is_dir():
+            _, invalid_links = _inspect_client_skill_links(cskills, shared_skills)
+            if invalid_links:
+                raise SyncError(
+                    f"{cname} has broken or conflicting per-skill entries under {cskills}: "
+                    f"{', '.join(invalid_links)}"
+                )
+        results[cname] = {"status": "NATIVE", "shared_root": str(shared_skills), "present": True}
+
     for cname in SKILL_LINK_CLIENTS:
         cdir = client_homes[cname]
         if not cdir.is_dir():
@@ -2699,13 +2895,15 @@ def _sync_multi_client_skills(
             if cskills.resolve(strict=False) == shared_skills.resolve(strict=False):
                 raise SyncError(f"{cname} skills directory must not symlink whole shared root")
             raise SyncError(f"{cname} skills directory is an unsafe symlink: {cskills}")
+        if cskills.exists() and not cskills.is_dir():
+            raise SyncError(f"{cname} skills path is not a directory: {cskills}")
         require_owned_directory(cskills, create=True)
         linked: list[str] = []
         for sname in MANAGED_SKILL_NAMES:
             link_path = cskills / sname
             target = shared_skills / sname
             if link_path.is_symlink():
-                if link_path.resolve(strict=False) == target.resolve(strict=False):
+                if link_path.exists() and link_path.resolve(strict=False) == target.resolve(strict=False):
                     linked.append(sname)
                     continue
                 link_path.unlink()
@@ -2724,6 +2922,8 @@ def _sync_multi_client_skills(
         if cfg_path.is_symlink():
             raise SyncError(f"unsafe Gemini config symlink: {cfg_path}")
         if cfg_path.exists():
+            if not cfg_path.is_file():
+                raise SyncError(f"Gemini skills.json is not a regular file: {cfg_path}")
             try:
                 cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
             except (OSError, ValueError) as exc:
@@ -2732,19 +2932,30 @@ def _sync_multi_client_skills(
                 raise SyncError("Gemini skills.json root must be an object")
         else:
             cfg = {}
-        key = "paths" if "paths" in cfg or "skillPaths" not in cfg else "skillPaths"
-        existing = cfg.get(key)
-        if existing is None:
-            entries: list[str] = []
-        elif isinstance(existing, list) and all(isinstance(x, str) for x in existing):
-            entries = list(existing)
+        existing_entries = cfg.get("entries")
+        if existing_entries is None:
+            entries: list[dict[str, Any]] = []
+        elif isinstance(existing_entries, list):
+            entries = []
+            for item in existing_entries:
+                if not isinstance(item, dict):
+                    raise SyncError("Gemini skills.json entries items must be objects")
+                raw_path = item.get("path")
+                if not isinstance(raw_path, str) or not raw_path.strip():
+                    raise SyncError("Gemini skills.json entry must contain a non-empty string path")
+                entries.append(dict(item))
         else:
-            raise SyncError(f"Gemini skills.json field {key} must be a list of strings")
+            raise SyncError("Gemini skills.json field entries must be a list")
         shared_str = str(shared_skills)
-        if shared_str not in entries:
-            entries.append(shared_str)
-        cfg[key] = entries
-        write_json(cfg_path, cfg, mode=0o600)
+        shared_resolved = shared_skills.resolve(strict=False)
+        already_registered = any(
+            _resolve_gemini_skill_path(item["path"], gemini_dir) == shared_resolved
+            for item in entries
+        )
+        if not already_registered:
+            entries.append({"path": shared_str})
+            cfg["entries"] = entries
+            write_json(cfg_path, cfg, mode=0o600)
         results["gemini"] = {"status": "SYNCED", "config": str(cfg_path), "registered": shared_str}
 
     codex_dir = client_homes["codex"]
@@ -2861,12 +3072,26 @@ def parser() -> argparse.ArgumentParser:
     subcommands = result.add_subparsers(dest="command", required=True)
     subcommands.add_parser("status")
     for sname in ("skill-check", "skill-install"):
-        sp = subcommands.add_parser(sname)
+        sp = subcommands.add_parser(
+            sname,
+            help=(
+                "verify managed Skill payload/lineage (top-level status) and multi-client exposure (client_status)"
+                if sname == "skill-check"
+                else "install managed Skill payload into shared root and sync client exposure"
+            ),
+        )
         sp.add_argument("--codex-home", type=Path)
         sp.add_argument("--claude-home", type=Path)
         sp.add_argument("--gemini-home", type=Path)
         sp.add_argument("--cursor-home", type=Path)
         sp.add_argument("--qoder-home", type=Path)
+        sp.add_argument("--qoder-cn-home", type=Path)
+        if sname == "skill-check":
+            sp.add_argument(
+                "--strict-clients",
+                action="store_true",
+                help="also exit non-zero when client_status is DRIFT or FAIL (top-level status stays payload-scoped)",
+            )
         if sname == "skill-install":
             sp.add_argument("--no-sync-clients", action="store_true")
     doctor_parser = subcommands.add_parser(
@@ -2959,6 +3184,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 ("gemini", "gemini_home"),
                 ("cursor", "cursor_home"),
                 ("qoder", "qoder_home"),
+                ("qoder-cn", "qoder_cn_home"),
             ):
                 val = getattr(args, attr, None)
                 if val is not None:
@@ -2966,7 +3192,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
             if args.command == "skill-check":
                 output = skill_check(sources, agents_root=args.agents_root.resolve(), client_homes=homes)
                 print(canonical_json(output).decode(), end="")
-                return 0 if output["status"] == "PASS" else 1
+                ok = output["status"] == "PASS"
+                if args.strict_clients:
+                    ok = ok and output["client_status"] in {"PASS", "SKIP"}
+                return 0 if ok else 1
             output = skill_install(
                 sources,
                 agents_root=args.agents_root.resolve(),

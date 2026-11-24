@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -1636,6 +1637,550 @@ class SkillSyncTests(unittest.TestCase):
                 allow_dirty_source=False,
             )
         self.assertEqual(self._current("snapshot-runner"), before)
+
+
+class MultiClientSkillSyncTests(unittest.TestCase):
+    """Isolated tests for B1/B2/B3 multi-client skill-check and skill-install behavior."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.repo_root = Path(__file__).resolve().parents[1]
+        self.cli = self.repo_root / "tool-skill-sync"
+        self.sources_root = self.root / "sources"
+        self.agents_root = self.root / ".agents"
+        self.bin_dir = self.root / "bin"
+        self.hooks_dir = self.root / "hooks"
+        self.sources_root.mkdir()
+        self.bin_dir.mkdir()
+        self.hooks_dir.mkdir()
+        self._build_valid_skill_sources()
+        self.sources = sync.Sources(self.sources_root)
+
+        self.client_homes = {
+            "codex": self.root / ".codex",
+            "claude": self.root / ".claude",
+            "gemini": self.root / ".gemini",
+            "cursor": self.root / ".cursor",
+            "qoder": self.root / ".qoder",
+            "qoder-cn": self.root / ".qoder-cn",
+        }
+
+    def _build_valid_skill_sources(self) -> None:
+        owner = self.sources_root / "git-finalizer"
+        skill = owner / "skills" / sync.SKILL_NAME
+        ref_links = "\n".join(
+            f"- [{rel}]({rel})"
+            for rel in sync.SKILL_PAYLOAD
+            if rel.startswith("references/")
+        )
+        for relative in sync.SKILL_PAYLOAD:
+            path = skill / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if relative == "SKILL.md":
+                path.write_text(
+                    "---\n"
+                    f"name: {sync.SKILL_NAME}\n"
+                    "description: Synthetic test canonical skill for multi-client sync.\n"
+                    "---\n\n"
+                    "# Synthetic Skill\n\n"
+                    f"{ref_links}\n",
+                    encoding="utf-8",
+                )
+            else:
+                path.write_text(f"# fixture {relative}\n", encoding="utf-8")
+            path.chmod(0o600)
+
+        compat = owner / "skills" / sync.COMPATIBILITY_SKILL_NAME / "SKILL.md"
+        compat.parent.mkdir(parents=True)
+        compat.write_text(
+            "---\n"
+            f"name: {sync.COMPATIBILITY_SKILL_NAME}\n"
+            "description: Deprecated compatibility entry.\n"
+            "---\n\n"
+            f"Use ${sync.SKILL_NAME}.\n",
+            encoding="utf-8",
+        )
+        compat.chmod(0o600)
+
+        compatibility = {
+            "schema_version": 1,
+            "toolchain_contract_version": 3,
+            "workflow_skill": {
+                "name": sync.SKILL_NAME,
+                "contract_version": 1,
+                "canonical_owner": "git-finalizer",
+                "compatibility_shims": [sync.COMPATIBILITY_SKILL_NAME],
+            },
+            "context_loader_contract_version": 1,
+            "snapshot_runner_contract_version": 1,
+            "git_finalizer_contract_version": 1,
+            "worktree_controller_adapter_version": 1,
+            "worktree_controller_status": "available_external",
+            "tools": {
+                "git-finalizer": {
+                    "source_directory": "git-finalizer",
+                    "public_cli_contract_version": 1,
+                    "skill_contract_version": 1,
+                }
+            },
+        }
+        write_json(owner / "toolchain_compatibility.json", compatibility)
+
+    def _isolated_env(self) -> dict[str, str]:
+        return {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(self.root),
+            "LC_ALL": "C.UTF-8",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "CODEX_HOME": str(self.client_homes["codex"]),
+            "CLAUDE_CONFIG_DIR": str(self.client_homes["claude"]),
+            "GEMINI_HOME": str(self.client_homes["gemini"]),
+            "CURSOR_HOME": str(self.client_homes["cursor"]),
+            "QODER_HOME": str(self.client_homes["qoder"]),
+            "QODER_CN_HOME": str(self.client_homes["qoder-cn"]),
+        }
+
+    def _run_cli(
+        self,
+        *subcommand_args: str,
+        include_client_flags: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        cmd = [
+            str(self.cli),
+            "--source-root",
+            str(self.sources_root),
+            "--agents-root",
+            str(self.agents_root),
+            "--bin-dir",
+            str(self.bin_dir),
+            "--hooks-dir",
+            str(self.hooks_dir),
+            *subcommand_args,
+        ]
+        if include_client_flags:
+            cmd.extend(
+                [
+                    "--codex-home",
+                    str(self.client_homes["codex"]),
+                    "--claude-home",
+                    str(self.client_homes["claude"]),
+                    "--gemini-home",
+                    str(self.client_homes["gemini"]),
+                    "--cursor-home",
+                    str(self.client_homes["cursor"]),
+                    "--qoder-home",
+                    str(self.client_homes["qoder"]),
+                    "--qoder-cn-home",
+                    str(self.client_homes["qoder-cn"]),
+                ]
+            )
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=self._isolated_env(),
+            check=False,
+        )
+
+    def _create_all_client_homes(self) -> None:
+        for path in self.client_homes.values():
+            path.mkdir(parents=True, exist_ok=True)
+
+    def test_multi_client_skill_install_and_check_isolated_with_qoder_cn(self) -> None:
+        self._create_all_client_homes()
+
+        res_inst = self._run_cli("skill-install")
+        self.assertEqual(res_inst.returncode, 0, msg=res_inst.stderr or res_inst.stdout)
+        install_doc = json.loads(res_inst.stdout)
+        self.assertEqual(install_doc["status"], "INSTALLED")
+        self.assertFalse((self.agents_root / "skills" / "synced").exists())
+
+        # Per-skill link clients (claude + qoder-cn) link inside the fixture.
+        for cname in ("claude", "qoder-cn"):
+            self.assertEqual(install_doc["clients"][cname]["status"], "SYNCED")
+            for sname in sync.MANAGED_SKILL_NAMES:
+                link = self.client_homes[cname] / "skills" / sname
+                self.assertTrue(link.is_symlink(), msg=f"missing symlink {link}")
+                resolved = link.resolve(strict=True)
+                self.assertEqual(resolved, (self.agents_root / "skills" / sname).resolve())
+                self.assertTrue(resolved.is_relative_to(self.root))
+
+        # Native shared-root clients (codex, cursor, qoder) do not create redundant symlinks.
+        for cname in ("codex", "cursor", "qoder"):
+            self.assertEqual(install_doc["clients"][cname]["status"], "NATIVE")
+            self.assertFalse((self.client_homes[cname] / "skills").exists())
+
+        # Gemini / AGY uses entries: [{"path": "..."}] with no spurious top-level paths key.
+        gemini_cfg = json.loads(
+            (self.client_homes["gemini"] / "config" / "skills.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(gemini_cfg, {"entries": [{"path": str(self.agents_root / "skills")}]})
+        self.assertNotIn("paths", gemini_cfg)
+
+        res_chk = self._run_cli("skill-check", "--strict-clients")
+        self.assertEqual(res_chk.returncode, 0, msg=res_chk.stderr or res_chk.stdout)
+        chk_doc = json.loads(res_chk.stdout)
+        self.assertEqual(chk_doc["status"], "PASS")
+        self.assertEqual(chk_doc["client_status"], "PASS")
+        self.assertEqual(
+            chk_doc["clients_summary"],
+            {
+                "status": "PASS",
+                "counts": {"PASS": 6, "DRIFT": 0, "FAIL": 0, "SKIP": 0},
+                "passed": ["claude", "codex", "cursor", "gemini", "qoder", "qoder-cn"],
+                "drifted": [],
+                "failing": [],
+                "skipped": [],
+            },
+        )
+        for cname in ("codex", "claude", "gemini", "cursor", "qoder", "qoder-cn"):
+            self.assertEqual(chk_doc["clients"][cname]["status"], "PASS")
+
+        # Verify env-only invocation (HOME + QODER_CN_HOME without CLI home flags) stays isolated.
+        env_chk = self._run_cli("skill-check", include_client_flags=False)
+        self.assertEqual(env_chk.returncode, 0, msg=env_chk.stderr or env_chk.stdout)
+        env_doc = json.loads(env_chk.stdout)
+        self.assertEqual(env_doc["client_status"], "PASS")
+        self.assertEqual(
+            env_doc["clients"]["gemini"]["config"],
+            str(self.client_homes["gemini"] / "config" / "skills.json"),
+        )
+
+    def test_gemini_agy_entries_lossless_read_write_and_legacy_read(self) -> None:
+        self._create_all_client_homes()
+        sync.skill_install(
+            self.sources,
+            agents_root=self.agents_root,
+            client_homes=self.client_homes,
+            sync_clients=False,
+        )
+        cfg_dir = self.client_homes["gemini"] / "config"
+        cfg_dir.mkdir(parents=True)
+        cfg_path = cfg_dir / "skills.json"
+
+        # Existing rich AGY config with inherits, filters, and custom top-level field.
+        initial_cfg = {
+            "inherits": [
+                {
+                    "path": "/shared/team-skills.json",
+                    "include_only": ["lint-skill"],
+                    "exclude": ["legacy-.*"],
+                }
+            ],
+            "entries": [
+                {
+                    "path": "/custom/project/skills",
+                    "exclude": ["experimental-.*"],
+                    "include_only": ["custom-skill"],
+                }
+            ],
+            "custom_flag": True,
+        }
+        cfg_path.write_text(json.dumps(initial_cfg, indent=2) + "\n", encoding="utf-8")
+
+        before = sync.skill_check(
+            self.sources, agents_root=self.agents_root, client_homes=self.client_homes
+        )
+        self.assertEqual(before["status"], "PASS")
+        self.assertEqual(before["clients"]["gemini"]["status"], "DRIFT")
+        self.assertEqual(before["clients"]["gemini"]["registered_paths"], [])
+
+        # Sync preserves inherits, existing entry fields, custom_flag, and avoids writing paths.
+        sync.skill_install(
+            self.sources, agents_root=self.agents_root, client_homes=self.client_homes
+        )
+        updated = json.loads(cfg_path.read_text(encoding="utf-8"))
+        self.assertEqual(updated["inherits"], initial_cfg["inherits"])
+        self.assertEqual(updated["custom_flag"], True)
+        self.assertNotIn("paths", updated)
+        self.assertEqual(
+            updated["entries"],
+            [
+                initial_cfg["entries"][0],
+                {"path": str(self.agents_root / "skills")},
+            ],
+        )
+
+        # Idempotent repeated sync adds no duplicates and leaves file untouched.
+        raw_before_repeat = cfg_path.read_bytes()
+        sync.skill_install(
+            self.sources, agents_root=self.agents_root, client_homes=self.client_homes
+        )
+        self.assertEqual(cfg_path.read_bytes(), raw_before_repeat)
+
+        # Home-relative (~/) and relative (.agents/skills) entries resolve and avoid duplication.
+        for raw_entry_path in ("~/.agents/skills", ".agents/skills"):
+            with (
+                self.subTest(raw_entry_path=raw_entry_path),
+                mock.patch.dict(os.environ, {"HOME": str(self.root)}, clear=False),
+            ):
+                preserved_cfg = {
+                    "inherits": [{"path": "/shared/base.json"}],
+                    "entries": [{"path": raw_entry_path, "exclude": ["wip-.*"]}],
+                }
+                encoded = json.dumps(preserved_cfg, indent=2) + "\n"
+                cfg_path.write_text(encoded, encoding="utf-8")
+
+                chk = sync.skill_check(
+                    self.sources, agents_root=self.agents_root, client_homes=self.client_homes
+                )
+                self.assertEqual(chk["clients"]["gemini"]["status"], "PASS")
+                self.assertEqual(
+                    chk["clients"]["gemini"]["registered_paths"],
+                    [str(self.agents_root / "skills")],
+                )
+
+                sync.skill_install(
+                    self.sources, agents_root=self.agents_root, client_homes=self.client_homes
+                )
+                self.assertEqual(cfg_path.read_text(encoding="utf-8"), encoded)
+
+        # Graceful read tolerance for legacy paths/skillPaths/skills lists.
+        cfg_path.write_text(
+            json.dumps({"paths": [str(self.agents_root / "skills")]}), encoding="utf-8"
+        )
+        legacy_chk = sync.skill_check(
+            self.sources, agents_root=self.agents_root, client_homes=self.client_homes
+        )
+        self.assertEqual(legacy_chk["clients"]["gemini"]["status"], "PASS")
+
+        # Malformed configs fail closed on both skill-check and skill-install.
+        for bad_text in (
+            "{not-json",
+            "[]",
+            json.dumps({"entries": "not-a-list"}),
+            json.dumps({"entries": ["not-an-object"]}),
+            json.dumps({"entries": [{}]}),
+            json.dumps({"entries": [{"path": "   "}]}),
+        ):
+            with self.subTest(bad_text=bad_text):
+                cfg_path.write_text(bad_text, encoding="utf-8")
+                chk = sync.skill_check(
+                    self.sources, agents_root=self.agents_root, client_homes=self.client_homes
+                )
+                self.assertEqual(chk["clients"]["gemini"]["status"], "FAIL")
+                self.assertIn("error", chk["clients"]["gemini"])
+                with self.assertRaises(sync.SyncError):
+                    sync.skill_install(
+                        self.sources, agents_root=self.agents_root, client_homes=self.client_homes
+                    )
+                self.assertEqual(cfg_path.read_text(encoding="utf-8"), bad_text)
+
+        # Symlinked and non-regular-file skills.json fail closed.
+        foreign = self.root / "foreign-skills.json"
+        foreign.write_text("{}", encoding="utf-8")
+        cfg_path.unlink()
+        cfg_path.symlink_to(foreign)
+        sym_chk = sync.skill_check(
+            self.sources, agents_root=self.agents_root, client_homes=self.client_homes
+        )
+        self.assertEqual(sym_chk["clients"]["gemini"]["status"], "FAIL")
+        with self.assertRaises(sync.SyncError):
+            sync.skill_install(
+                self.sources, agents_root=self.agents_root, client_homes=self.client_homes
+            )
+
+        cfg_path.unlink()
+        cfg_path.mkdir()
+        dir_chk = sync.skill_check(
+            self.sources, agents_root=self.agents_root, client_homes=self.client_homes
+        )
+        self.assertEqual(dir_chk["clients"]["gemini"]["status"], "FAIL")
+        self.assertIn("not a regular file", dir_chk["clients"]["gemini"]["error"])
+        with self.assertRaisesRegex(sync.SyncError, "not a regular file"):
+            sync.skill_install(
+                self.sources, agents_root=self.agents_root, client_homes=self.client_homes
+            )
+
+    def test_native_shared_root_clients_and_strict_broken_link_detection(self) -> None:
+        self._create_all_client_homes()
+
+        # Before payload installation, native clients report DRIFT (shared skills absent).
+        pre_chk = sync.skill_check(
+            self.sources, agents_root=self.agents_root, client_homes=self.client_homes
+        )
+        self.assertEqual(pre_chk["status"], "DRIFT")
+        for cname in ("codex", "cursor", "qoder"):
+            self.assertEqual(pre_chk["clients"][cname]["status"], "DRIFT")
+
+        # Fail-closed check: broken native client entry stops skill-install BEFORE mutating claude/qoder-cn.
+        stale_target = self.root / "deleted-tmp" / "agents" / "skills" / sync.SKILL_NAME
+        (self.client_homes["cursor"] / "skills").mkdir()
+        (self.client_homes["cursor"] / "skills" / sync.SKILL_NAME).symlink_to(stale_target)
+        with self.assertRaisesRegex(sync.SyncError, "broken or conflicting"):
+            sync.skill_install(
+                self.sources, agents_root=self.agents_root, client_homes=self.client_homes
+            )
+        self.assertFalse((self.client_homes["claude"] / "skills").exists())
+        self.assertFalse((self.client_homes["qoder-cn"] / "skills").exists())
+        (self.client_homes["cursor"] / "skills" / sync.SKILL_NAME).unlink()
+        (self.client_homes["cursor"] / "skills").rmdir()
+
+        # Install payload + sync clients -> all PASS.
+        sync.skill_install(
+            self.sources, agents_root=self.agents_root, client_homes=self.client_homes
+        )
+
+        # Valid optional per-skill symlink under cursor/qoder stays PASS.
+        (self.client_homes["cursor"] / "skills").mkdir()
+        (self.client_homes["cursor"] / "skills" / sync.SKILL_NAME).symlink_to(
+            self.agents_root / "skills" / sync.SKILL_NAME
+        )
+        valid_opt_chk = sync.skill_check(
+            self.sources, agents_root=self.agents_root, client_homes=self.client_homes
+        )
+        self.assertEqual(valid_opt_chk["clients"]["cursor"]["status"], "PASS")
+        self.assertEqual(valid_opt_chk["clients"]["cursor"]["invalid_links"], [])
+
+        # Broken symlink (like stale /tmp/... target) must FAIL on cursor, qoder, qoder-cn, claude.
+        for cname in ("cursor", "qoder", "qoder-cn", "claude"):
+            with self.subTest(broken_symlink_client=cname):
+                cskills = self.client_homes[cname] / "skills"
+                cskills.mkdir(exist_ok=True)
+                link = cskills / sync.SKILL_NAME
+                if link.is_symlink() or link.exists():
+                    link.unlink()
+                link.symlink_to(stale_target)
+
+                chk = sync.skill_check(
+                    self.sources, agents_root=self.agents_root, client_homes=self.client_homes
+                )
+                self.assertEqual(chk["status"], "PASS")
+                self.assertEqual(chk["clients"][cname]["status"], "FAIL")
+                self.assertEqual(chk["clients"][cname]["invalid_links"], [sync.SKILL_NAME])
+                self.assertEqual(chk["client_status"], "FAIL")
+                self.assertIn(cname, chk["clients_summary"]["failing"])
+
+                if cname in sync.NATIVE_SHARED_ROOT_CLIENTS:
+                    with self.assertRaisesRegex(sync.SyncError, "broken or conflicting"):
+                        sync.skill_install(
+                            self.sources,
+                            agents_root=self.agents_root,
+                            client_homes=self.client_homes,
+                        )
+                    link.unlink()
+                else:
+                    # Link clients repair broken symlinks during skill-install.
+                    sync.skill_install(
+                        self.sources,
+                        agents_root=self.agents_root,
+                        client_homes=self.client_homes,
+                    )
+                    self.assertEqual(
+                        link.resolve(strict=True),
+                        (self.agents_root / "skills" / sync.SKILL_NAME).resolve(),
+                    )
+
+        # Wrong-target symlink and non-symlink directory shadowing entry also FAIL.
+        other_dir = self.root / "other-skill"
+        other_dir.mkdir()
+        qoder_skills = self.client_homes["qoder"] / "skills"
+        qoder_skills.mkdir(exist_ok=True)
+        wrong_link = qoder_skills / sync.SKILL_NAME
+        wrong_link.symlink_to(other_dir)
+        wrong_chk = sync.skill_check(
+            self.sources, agents_root=self.agents_root, client_homes=self.client_homes
+        )
+        self.assertEqual(wrong_chk["clients"]["qoder"]["status"], "FAIL")
+        self.assertEqual(wrong_chk["clients"]["qoder"]["invalid_links"], [sync.SKILL_NAME])
+        wrong_link.unlink()
+
+        shadow_dir = qoder_skills / sync.COMPATIBILITY_SKILL_NAME
+        shadow_dir.mkdir()
+        shadow_chk = sync.skill_check(
+            self.sources, agents_root=self.agents_root, client_homes=self.client_homes
+        )
+        self.assertEqual(shadow_chk["clients"]["qoder"]["status"], "FAIL")
+        self.assertEqual(
+            shadow_chk["clients"]["qoder"]["invalid_links"], [sync.COMPATIBILITY_SKILL_NAME]
+        )
+        shadow_dir.rmdir()
+        qoder_skills.rmdir()
+
+        # Whole-root skills symlink and non-directory skills path both FAIL.
+        (self.client_homes["qoder"] / "skills").symlink_to(self.agents_root / "skills")
+        root_sym_chk = sync.skill_check(
+            self.sources, agents_root=self.agents_root, client_homes=self.client_homes
+        )
+        self.assertEqual(root_sym_chk["clients"]["qoder"]["status"], "FAIL")
+        self.assertIn("whole-root symlink", root_sym_chk["clients"]["qoder"]["error"])
+        (self.client_homes["qoder"] / "skills").unlink()
+
+        (self.client_homes["qoder"] / "skills").write_text("not a dir\n", encoding="utf-8")
+        not_dir_chk = sync.skill_check(
+            self.sources, agents_root=self.agents_root, client_homes=self.client_homes
+        )
+        self.assertEqual(not_dir_chk["clients"]["qoder"]["status"], "FAIL")
+        self.assertIn("not a directory", not_dir_chk["clients"]["qoder"]["error"])
+
+    def test_skill_check_client_summary_and_strict_clients_compat(self) -> None:
+        # 1. All clients absent -> payload PASS + client_status SKIP.
+        sync.skill_install(
+            self.sources,
+            agents_root=self.agents_root,
+            client_homes=self.client_homes,
+            sync_clients=False,
+        )
+        skip_default = self._run_cli("skill-check")
+        self.assertEqual(skip_default.returncode, 0, msg=skip_default.stderr)
+        skip_doc = json.loads(skip_default.stdout)
+        self.assertEqual(skip_doc["status"], "PASS")
+        self.assertEqual(skip_doc["client_status"], "SKIP")
+        self.assertEqual(
+            skip_doc["clients_summary"]["counts"],
+            {"PASS": 0, "DRIFT": 0, "FAIL": 0, "SKIP": 6},
+        )
+        skip_strict = self._run_cli("skill-check", "--strict-clients")
+        self.assertEqual(skip_strict.returncode, 0, msg=skip_strict.stderr)
+
+        # 2. Payload PASS + client DRIFT -> default exits 0 (compat), --strict-clients exits 1.
+        self.client_homes["claude"].mkdir()
+        self.client_homes["cursor"].mkdir()
+        drift_default = self._run_cli("skill-check")
+        self.assertEqual(drift_default.returncode, 0, msg=drift_default.stderr)
+        drift_doc = json.loads(drift_default.stdout)
+        self.assertEqual(drift_doc["status"], "PASS")
+        self.assertEqual(drift_doc["client_status"], "DRIFT")
+        self.assertEqual(drift_doc["clients_summary"]["drifted"], ["claude"])
+        self.assertEqual(drift_doc["clients_summary"]["passed"], ["cursor"])
+        self.assertEqual(drift_doc["clients_summary"]["counts"]["SKIP"], 4)
+
+        drift_strict = self._run_cli("skill-check", "--strict-clients")
+        self.assertEqual(drift_strict.returncode, 1)
+        drift_strict_doc = json.loads(drift_strict.stdout)
+        self.assertEqual(drift_strict_doc["status"], "PASS")
+        self.assertEqual(drift_strict_doc["client_status"], "DRIFT")
+
+        # 3. Payload PASS + client FAIL (precedence FAIL > DRIFT > PASS > SKIP).
+        self.client_homes["qoder-cn"].mkdir()
+        (self.client_homes["qoder-cn"] / "skills").mkdir()
+        (self.client_homes["qoder-cn"] / "skills" / sync.SKILL_NAME).symlink_to(
+            self.root / "nonexistent-stale-target"
+        )
+        fail_default = self._run_cli("skill-check")
+        self.assertEqual(fail_default.returncode, 0, msg=fail_default.stderr)
+        fail_doc = json.loads(fail_default.stdout)
+        self.assertEqual(fail_doc["status"], "PASS")
+        self.assertEqual(fail_doc["client_status"], "FAIL")
+        self.assertEqual(fail_doc["clients_summary"]["failing"], ["qoder-cn"])
+        self.assertEqual(fail_doc["clients_summary"]["drifted"], ["claude"])
+        self.assertEqual(fail_doc["clients_summary"]["passed"], ["cursor"])
+
+        fail_strict = self._run_cli("skill-check", "--strict-clients")
+        self.assertEqual(fail_strict.returncode, 1)
+        self.assertEqual(json.loads(fail_strict.stdout)["status"], "PASS")
+
+        # 4. Payload FAIL (untrusted live drift) exits 1 even without --strict-clients.
+        (self.agents_root / "skills" / sync.SKILL_NAME / "SKILL.md").write_text(
+            "hand-edited untrusted drift\n", encoding="utf-8"
+        )
+        payload_fail = self._run_cli("skill-check")
+        self.assertEqual(payload_fail.returncode, 1)
+        payload_fail_doc = json.loads(payload_fail.stdout)
+        self.assertEqual(payload_fail_doc["status"], "FAIL")
+        self.assertFalse(payload_fail_doc["trusted_lineage"])
 
 
 if __name__ == "__main__":

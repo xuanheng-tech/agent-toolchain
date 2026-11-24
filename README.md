@@ -52,7 +52,10 @@ tool-skill-sync doctor --repo /path/to/checkout --summary
 tool-skill-sync check --source-only git-finalizer
 
 # Check or sync multi-client shared Skill links
+# Top-level `status` reflects managed Skill payload/lineage verification (exit 0 on PASS);
+# `client_status` / `clients_summary` report independent multi-client exposure (add --strict-clients to gate exit code on client exposure)
 tool-skill-sync skill-check
+tool-skill-sync skill-check --strict-clients
 tool-skill-sync skill-install
 ```
 
